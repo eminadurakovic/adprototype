@@ -1,0 +1,68 @@
+// espB_main.cpp
+#include <WiFi.h>
+#include <WebSocketsClient.h>
+#include "esp_adc_cal.h"
+#include "driver/adc.h"
+#include <ArduinoJson.h>
+
+const char* SSID = "ADPrototype";
+const char* PASS = "12345678";
+const char* WS_HOST = "192.168.4.1";
+const uint16_t WS_PORT = 80;
+const char* WS_PATH = "/ws";
+
+// Inputs from A's DACs:
+#define ADC_CH_0       ADC1_CHANNEL_6     // B GPIO34 ← A GPIO25
+#define ADC_CH_1       ADC1_CHANNEL_7     // B GPIO35 ← A GPIO26
+#define ADC_WIDTH_CFG  ADC_WIDTH_BIT_12
+#define ADC_ATTEN_CFG  ADC_ATTEN_DB_11
+#define VREF_MV        1100
+#define SAMPLES        128
+
+esp_adc_cal_characteristics_t adc_chars;
+WebSocketsClient ws;
+
+static float readV(adc1_channel_t ch) {
+  uint32_t acc = 0;
+  for (int i = 0; i < SAMPLES; ++i) acc += adc1_get_raw(ch);
+  acc /= SAMPLES;
+  uint32_t mv = esp_adc_cal_raw_to_voltage(acc, &adc_chars);
+  float v = mv / 1000.0f;
+  return constrain(v, 0.0f, 3.3f);
+}
+
+void setup() {
+  Serial.begin(115200);
+  WiFi.setSleep(false);
+  WiFi.begin(SSID, PASS);
+  while (WiFi.status() != WL_CONNECTED) { delay(250); Serial.print("."); }
+  Serial.println("\nWiFi OK");
+
+  adc1_config_width(ADC_WIDTH_CFG);
+  adc1_config_channel_atten(ADC_CH_0, ADC_ATTEN_CFG);
+  adc1_config_channel_atten(ADC_CH_1, ADC_ATTEN_CFG);
+  esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_CFG, ADC_WIDTH_CFG, VREF_MV, &adc_chars);
+
+  ws.begin(WS_HOST, WS_PORT, WS_PATH);
+  ws.onEvent([](WStype_t, uint8_t*, size_t){}); // not required to react to messages
+}
+
+void loop() {
+  ws.loop();
+  static uint32_t t = 0;
+  if (millis() - t >= 200) {
+    float v0 = readV(ADC_CH_0);
+    float v1 = readV(ADC_CH_1);
+
+    StaticJsonDocument<96> doc;
+    JsonArray arr = doc.createNestedArray("received");
+    arr.add(roundf(v0 * 100) / 100.0f);
+    arr.add(roundf(v1 * 100) / 100.0f);
+    String out; serializeJson(doc, out);
+
+    ws.sendTXT(out);   // A will rebroadcast to the app
+    Serial.println(out);
+
+    t = millis();
+  }
+}
