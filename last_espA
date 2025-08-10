@@ -1,0 +1,160 @@
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include "esp_adc_cal.h"
+#include "driver/adc.h"
+#include <ArduinoJson.h>
+
+// ---- Wi-Fi AP ----
+static const char* SSID = "ESP-Connect";
+static const char* PASS = "12345678";
+
+// ---- Analog inputs ----
+#define ADC_CH_0       ADC1_CHANNEL_6     // GPIO34
+#define ADC_CH_1       ADC1_CHANNEL_7     // GPIO35
+#define ADC_WIDTH_CFG  ADC_WIDTH_BIT_12
+#define ADC_ATTEN_CFG  ADC_ATTEN_DB_11
+#define VREF_MV        1100
+#define SAMPLES        64
+
+// ---- DAC outputs ----
+#define DAC_PIN_0      25 // DAC1
+#define DAC_PIN_1      26 // DAC2
+
+// ---- LED ----
+#define LED_PIN        2
+
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+esp_adc_cal_characteristics_t adc_chars;
+
+// State
+float rawEMA[2]   = {0.0f, 0.0f};
+bool  dynEnable   = false;
+float kGain[2]    = {0.0f, 0.0f};
+float bBias[2]    = {0.0f, 0.0f};
+
+// Smoothing
+static const float EMA_ALPHA = 0.2f;
+
+// ---- Helpers ----
+static float readADC(adc1_channel_t ch) {
+  uint32_t acc = 0;
+  for (int i = 0; i < SAMPLES; ++i) acc += adc1_get_raw(ch);
+  acc /= SAMPLES;
+  uint32_t mv = esp_adc_cal_raw_to_voltage(acc, &adc_chars);
+  return mv / 1000.0f;
+}
+
+static uint8_t vToDacCode(float v) {
+  v = constrain(v, 0.0f, 3.3f);
+  int code = (int)(v / 3.3f * 255.0f + 0.5f);
+  return (uint8_t)constrain(code, 0, 255);
+}
+
+static void broadcastApplied(float a0, float a1) {
+  StaticJsonDocument<96> doc;
+  JsonArray arr = doc.createNestedArray("applied");
+  arr.add(roundf(a0 * 100) / 100.0f);
+  arr.add(roundf(a1 * 100) / 100.0f);
+  String out; serializeJson(doc, out);
+  ws.textAll(out);
+}
+
+static void writeDacsAndBroadcast(float a0, float a1) {
+  dacWrite(DAC_PIN_0, vToDacCode(a0));
+  dacWrite(DAC_PIN_1, vToDacCode(a1));
+  broadcastApplied(a0, a1);
+}
+
+static void applyDynamic() {
+  float off0 = kGain[0] * rawEMA[0] + bBias[0];
+  float off1 = kGain[1] * rawEMA[1] + bBias[1];
+  float a0 = constrain(rawEMA[0] + off0, 0.0f, 3.3f);
+  float a1 = constrain(rawEMA[1] + off1, 0.0f, 3.3f);
+  writeDacsAndBroadcast(a0, a1);
+  digitalWrite(LED_PIN, HIGH); delay(30); digitalWrite(LED_PIN, LOW);
+}
+
+// ---- WebSocket Event ----
+static void onWsEvent(AsyncWebSocket*, AsyncWebSocketClient*, AwsEventType type,
+                      void*, uint8_t* data, size_t len) {
+  if (type != WS_EVT_DATA) return;
+
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, data, len)) return;
+
+  // Dynamic mode
+  if (doc["dyn"].is<JsonObject>()) {
+    JsonObject dyn = doc["dyn"].as<JsonObject>();
+
+    if (dyn["enable"].is<bool>()) {
+      dynEnable = dyn["enable"].as<bool>();
+    }
+    if (dyn["k"].is<JsonArray>()) {
+      JsonArray arr = dyn["k"].as<JsonArray>();
+      if (arr.size() > 0) kGain[0] = arr[0].as<float>();
+      if (arr.size() > 1) kGain[1] = arr[1].as<float>();
+    }
+    if (dyn["b"].is<JsonArray>()) {
+      JsonArray arr = dyn["b"].as<JsonArray>();
+      if (arr.size() > 0) bBias[0] = arr[0].as<float>();
+      if (arr.size() > 1) bBias[1] = arr[1].as<float>();
+    }
+  }
+
+  // Forward received voltages from B
+  if (doc["received"].is<JsonArray>()) {
+    ws.textAll(String((const char*)data, len));
+  }
+}
+
+void setup() {
+  pinMode(LED_PIN, OUTPUT);
+  dacWrite(DAC_PIN_0, 0);
+  dacWrite(DAC_PIN_1, 0);
+  Serial.begin(115200);
+
+  adc1_config_width(ADC_WIDTH_CFG);
+  adc1_config_channel_atten(ADC_CH_0, ADC_ATTEN_CFG);
+  adc1_config_channel_atten(ADC_CH_1, ADC_ATTEN_CFG);
+  esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_CFG, ADC_WIDTH_CFG, VREF_MV, &adc_chars);
+
+  WiFi.softAP(SSID, PASS);
+  Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
+
+  ws.onEvent(onWsEvent);
+  server.addHandler(&ws);
+  server.begin();
+}
+
+void loop() {
+  static uint32_t t = 0, tClean = 0;
+
+  if (millis() - t >= 1000) {
+    float r0 = readADC(ADC_CH_0);
+    float r1 = readADC(ADC_CH_1);
+
+    if (t == 0) { rawEMA[0] = r0; rawEMA[1] = r1; }
+    else {
+      rawEMA[0] = (1.0f - EMA_ALPHA) * rawEMA[0] + EMA_ALPHA * r0;
+      rawEMA[1] = (1.0f - EMA_ALPHA) * rawEMA[1] + EMA_ALPHA * r1;
+    }
+
+    // Broadcast smoothed raw values
+    StaticJsonDocument<96> doc;
+    JsonArray arr = doc.createNestedArray("raw");
+    arr.add(roundf(rawEMA[0] * 100) / 100.0f);
+    arr.add(roundf(rawEMA[1] * 100) / 100.0f);
+    String out; serializeJson(doc, out);
+    ws.textAll(out);
+
+    if (dynEnable) applyDynamic();
+
+    t = millis();
+  }
+
+  if (millis() - tClean >= 2000) {
+    ws.cleanupClients();
+    tClean = millis();
+  }
+}
